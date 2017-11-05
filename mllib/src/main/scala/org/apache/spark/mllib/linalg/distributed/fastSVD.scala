@@ -70,11 +70,10 @@ import breeze.numerics.{sqrt => brzSqrt}
 @Since("1.0.0")
 def computeSVD(
     a: RowMatrix,
-    k: Int,
-    mode: String = "auto"
+    k: Int
     ): SingularValueDecomposition[RowMatrix, Matrix] = {
 
-  computeSVD(a, k, false, 2, -1, mode)
+  computeSVD(a, k)
 }
 
   /**
@@ -88,9 +87,9 @@ def computeSVD(
   *             local-svd: compute gram matrix and computes its full SVD locally,
   *             local-eigs: compute gram matrix and computes its top eigenvalues locally,
   *             dist-eigs: compute the top eigenvalues of the gram matrix distributively)
-  * @return SingularValueDecomposition(U, s, V). U = null if computeU = false.
+  * @return SingularValueDecomposition(U, s, V)
   */
-private[mllib] def computeSVD(
+def computeSVD(
     a: RowMatrix,
     k: Int,
     center: Boolean = false,
@@ -129,29 +128,32 @@ private[mllib] def computeSVD(
     case _ => throw new IllegalArgumentException(s"Do not support mode $mode.")
   }
 
-  if (l == -1) {
-    l = k + 2
+  if (blk_size == -1) {
+    blk_size = k + 2
+  }
+  if (blk_size < 0) {
+    throw new IllegalArgumentException("Block size for SVD must be > 0, defaults to k+2")
   }
   val m = a.numRows()
   val n = a.numCols()
   val maxK = min(m, n)
   require(k <= maxK, "number of singular values must be less than min(rows, cols)")
-  val c: RowMatrix
+  val c
   if (center == true) {
     //TODO: Center the 'a' matrix
     c = a // NOT FINISHED
   }
-
+  c = c.asBreeze.asInstanceOf[BDM[Double]]
   // Use the val "c" from here to refer to the source data matrix
  
-  if (l >= m / 1.25 || l >= n / 1.25) {
+  if (blk_size >= m / 1.25 || blk_size >= n / 1.25) {
     //Perform NORMAL SVD Here.
     // Return the SVD from here
   } else if (m >= n) {
     ///////////////////////////////////////////////////////
     // Step 1:
     // Generate Q matrix with values between -1 and 1.
-    // Size n rows, 1 col
+    // Size n rows, l col
     ///////////////////////////////////////////////////////
     
     // Python from FBPCA
@@ -163,6 +165,12 @@ private[mllib] def computeSVD(
     // if not isreal:
     //     Q = mult(A, np.random.uniform(low=-1.0, high=1.0, size=(n, l))
     //         + 1j * np.random.uniform(low=-1.0, high=1.0, size=(n, l)))
+
+    // Don't worry about isreal - just do it for normal scalars
+    
+    // multiply the original data matrix with a random matrix
+    // size m x n * n x blk_size ==> m x blk_size
+    val Q: BDM = c * ((BDM.rand(n, l) :* 2) - 1)
 
     ////////////////////////////////////////////////////////
     // Step 2:
@@ -221,7 +229,7 @@ private[mllib] def computeSVD(
     // Step 5:
     // Retain only the first k rows/columns and return
     ////////////////////////////////////////////////////////
-    
+
     // #
     // # Retain only the leftmost k columns of U, the uppermost
     // # k rows of Va, and the first k entries of s.
