@@ -170,11 +170,11 @@ def computeSVD(
     
     // multiply the original data matrix with a random matrix
     // size m x n * n x blk_size ==> m x blk_size
-    val Q: BDM = c * ((BDM.rand(n, l) :* 2) - 1)
+    val Q: BDM[Double] = c * ((BDM.rand(n, l) :* 2) - 1)
 
     ////////////////////////////////////////////////////////
     // Step 2:
-    // Perform the QR decomposition
+    // Perform the QR/LU decomposition
     ////////////////////////////////////////////////////////
 
     // Python from FBPCA
@@ -186,6 +186,29 @@ def computeSVD(
     //     (Q, _) = qr(Q, mode='economic')
     // if n_iter > 0:
     //     (Q, _) = lu(Q, permute_l=True)
+
+    if (p_iter == 0) {
+      val (Q: BDM[Double], R:BDM[Double]) = computeMode match {
+      case SVDMode.LocalARPACK =>
+        // Compute QR locally with arpack
+      case SVDMode.LocalLAPACK =>
+        // Copmute with LAPACK
+      case SVDMode.DistARPACK =>
+        // Copmute QR in distributed fashion
+      }
+    } else if (p_iter > 0) {
+      // TODO: Come up with a way to calculate the LU factorization.
+      // See
+      // https://issues.apache.org/jira/browse/SPARK-8514
+      val (Q: BDM[Double], R:BDM[Double]) = computeMode match {
+      case SVDMode.LocalARPACK =>
+        // Compute LU locally with arpack
+      case SVDMode.LocalLAPACK =>
+        // Compute LU with LAPACK
+      case SVDMode.DistARPACK =>
+        // Copmute LU in distributed fashion
+      }
+    }
 
     /////////////////////////////////////////////////////////
     // Step 3:
@@ -209,6 +232,26 @@ def computeSVD(
     //     else:
     //         (Q, _) = qr(Q, mode='economic')
 
+    for (i <- 0 to p_iter) {
+      // We're not worried about conjugates - assume we're working with
+      // real numbers
+      // We need to write a transpose function
+      Q = transpose(transpose(Q) * c)
+
+      // We also need a function to compute the LU factorization of Q
+      val (Q: BDM[Double], U: BDM[Double]) = lu(Q)
+
+      Q = A * Q
+
+      if (i + 1 < p_iter ) {
+        // Compute LU
+      } else {
+        // Compute QR
+      }
+    
+    }
+
+
     /////////////////////////////////////////////////////////
     // Step 4:
     // SVD Q and original matrix to get singular values
@@ -224,6 +267,10 @@ def computeSVD(
     // (R, s, Va) = svd(QA, full_matrices=False)
     // U = Q.dot(R)
 
+    val QA = transpose(Q) * A
+    // Perform local ARPACK SVD on this matrix (Or normal rowmatrix SVD?)
+    val (R, s, Va) = svd(QA)
+    val U = Q * R
 
     ////////////////////////////////////////////////////////
     // Step 5:
@@ -235,6 +282,9 @@ def computeSVD(
     // # k rows of Va, and the first k entries of s.
     // #
     // return U[:, :k], s[:k], Va[:k, :]
+
+    // Truncate rows of U, s, and Va
+    val svdVals: SingularValueDecomposition
 
   } else if (m < n) {
 
