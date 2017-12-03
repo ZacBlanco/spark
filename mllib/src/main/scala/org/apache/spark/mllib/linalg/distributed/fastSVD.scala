@@ -19,6 +19,7 @@ package org.apache.spark.mllib.linalg.distributed;
 
 import java.util.Arrays
 
+import breeze.linalg.svd.SVD
 import org.apache.spark.annotation.Since
 import org.apache.spark.mllib.linalg.{Matrix => SparkMatrix}
 import org.apache.spark.mllib.linalg.Matrices
@@ -327,7 +328,41 @@ object fastSVD {
 //       val rows = columns.toSeq.transpose // Skip this if you want a column-major RDD
 //       val mat = RowMatrix(rows.map(row => new DenseVector(row.toArray)))
 //       computeSVD(mat, k, center, p_iter, blk_size, mode)
-       SingularValueDecomposition(null, null, null)
+
+       var q: BDM[Double] = (( (BDM.rand(blk_size, m.toInt) :* 2.0) - 1.0) * c).t
+
+       if (p_iter == 0) {
+         val qr: BQR.DenseQR = BQR.apply(q)
+         q = qr.q
+       } else if (p_iter > 0) {
+         var (lu, _) = BLU.apply(q)
+         q = lu
+       }
+
+       for (i <- 0 to p_iter) {
+         q = (c * q)
+         var (q2: BDM[Double], _) = BLU.apply(q)
+         q = (q.t * c).t
+
+         if (i + 1 < p_iter ) {
+           var (q3: BDM[Double], _) = BLU.apply(q)
+           q = q3
+         } else {
+           val qr: BQR.DenseQR = BQR.apply(q)
+           q = qr.q
+         }
+       }
+
+       var aq = c * q
+       val brzSvd.SVD(u, s, tempV) = brzSvd(aq)
+       q = tempV * (q.t)
+
+       var U = Matrices.dense(u.rows, k, u.data)
+       var sigmas = Vectors.dense(Arrays.copyOfRange(s.data, 0, k))
+       var Va = Matrices.dense(k, q.cols, q.data)
+
+
+       SingularValueDecomposition(U, sigmas, Va)
      } else {
        null
      }
