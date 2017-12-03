@@ -17,11 +17,19 @@
 
 package org.apache.spark.mllib.linalg.distributed;
 
-import org.apache.spark.mllib.linalg.distributed.RowMatrix
-import breeze.linalg.{axpy => brzAxpy, inv, svd => brzSvd, DenseMatrix => BDM, DenseVector => BDV,
-  MatrixSingularException, SparseVector => BSV}
-import breeze.numerics.{sqrt => brzSqrt}
+import java.util.Arrays
 
+import org.apache.spark.annotation.Since
+import org.apache.spark.mllib.linalg.Matrices
+import org.apache.spark.mllib.linalg.Vectors
+import org.apache.spark.mllib.linalg.DenseVector
+import org.apache.spark.mllib.linalg.SingularValueDecomposition
+import org.apache.spark.mllib.linalg.distributed.RowMatrix
+import breeze.linalg.{Matrix, MatrixSingularException, inv, DenseMatrix => BDM, DenseVector => BDV, LU => BLU, SparseVector => BSV, axpy => brzAxpy, qr => BQR, svd => brzSvd}
+import breeze.numerics.{sqrt => brzSqrt}
+import org.apache.spark.mllib.linalg
+
+object fastSVD {
 
   /**
    * Computes singular value decomposition of this matrix. Denote this matrix by A (m x n). This
@@ -61,26 +69,39 @@ import breeze.numerics.{sqrt => brzSqrt}
    *          converged before the maximum number of Arnoldi update iterations is reached (in case
    *          that matrix A is ill-conditioned).
    *              are treated as zero, where sigma(0) is the largest singular value.
-   * @param mode: Mode to perform ARPACK operations with (default = auto, otherwise, "local-svd", "local-eigs", "dist-eigs")
+   * @param mode: Mode to perform ARPACK operations with
+                  (default = auto, otherwise, "local-svd", "local-eigs", "dist-eigs")
    * @return SingularValueDecomposition(U, s, V). U = null if computeU = false.
    *
    * @note The conditions that decide which method to use internally and the default parameters are
    * subject to change.
    */
-@Since("1.0.0")
-def computeSVD(
-    a: RowMatrix,
-    k: Int
-    ): SingularValueDecomposition[RowMatrix, Matrix] = {
 
-  computeSVD(a, k)
-}
+  def lu(a: BDM[Double]): (BDM[Double], Array[Int]) = {
+    BLU(a)
+  }
+  def transpose(a: BDM[Double]): BDM[Double] = {
+    a.t
+  }
+
+  @Since("1.0.0")
+  def computeSVD(
+      a: RowMatrix,
+      k: Int
+      ): SingularValueDecomposition[RowMatrix, RowMatrix] = {
+
+    computeSVD(a, k)
+  }
+
+  def min(a: Long, b: Long): Long = if (a < b)  a else b
 
   /**
   * The actual SVD implementation, visible for testing.
   *
+  * @param a The matrix to compute SVD on
   * @param k number of leading singular values to keep (0 &lt; k &lt;= n)
-  * @param center Whether or not the data must be centered (if center = true rows will be mean-centered)
+  * @param center Whether or not the data must be centered
+                  (if center = true rows will be mean-centered)
   * @param p_iter The number of power iterations to conduct. defaults to 2
   * @param blk_size The block size of the normalized power iterations, defaults to k+2
   * @param mode computation mode (auto: determine automatically which mode to use,
@@ -89,282 +110,215 @@ def computeSVD(
   *             dist-eigs: compute the top eigenvalues of the gram matrix distributively)
   * @return SingularValueDecomposition(U, s, V)
   */
-def computeSVD(
-    a: RowMatrix,
-    k: Int,
-    center: Boolean = false,
-    p_iter: Int = 2,
-    blk_size: Int = -1, 
-    mode: String): SingularValueDecomposition[RowMatrix, Matrix] = {
-  val n = a.numCols().toInt
-  require(k > 0 && k <= n, s"Requested k singular values but got k=$k and numCols=$n.")
+  def computeSVD(
+      a: RowMatrix,
+      k: Int,
+      center: Boolean = false,
+      p_iter: Int = 2,
+      blk_size: Int = -1,
+      mode: String): SingularValueDecomposition[RowMatrix, RowMatrix] = {
+    var n = a.numCols().toInt
+    require(k > 0 && k <= n, s"Requested k singular values but got k=$k and numCols=$n.")
 
-  object SVDMode extends Enumeration {
-    val LocalARPACK, LocalLAPACK, DistARPACK = Value
-  }
+    object SVDMode extends Enumeration {
+      val LocalARPACK, LocalLAPACK, DistARPACK = Value
+    }
 
-  val computeMode = mode match {
-    case "auto" =>
-      if (k > 5000) {
-        logWarning(s"computing svd with k=$k and n=$n, please check necessity")
-      }
-
-      // TODO: The conditions below are not fully tested.
-      if (n < 100 || (k > n / 2 && n <= 15000)) {
-        // If n is small or k is large compared with n, we better compute the Gramian matrix first
-        // and then compute its eigenvalues locally, instead of making multiple passes.
-        if (k < n / 3) {
-          SVDMode.LocalARPACK
-        } else {
-          SVDMode.LocalLAPACK
+    val computeMode = mode match {
+      case "auto" =>
+        if (k > 5000) {
+          //logWarning(s"computing svd with k=$k and n=$n, please check necessity")
         }
-      } else {
-        // If k is small compared with n, we use ARPACK with distributed multiplication.
-        SVDMode.DistARPACK
-      }
-    case "local-svd" => SVDMode.LocalLAPACK
-    case "local-eigs" => SVDMode.LocalARPACK
-    case "dist-eigs" => SVDMode.DistARPACK
-    case _ => throw new IllegalArgumentException(s"Do not support mode $mode.")
-  }
 
-  if (blk_size == -1) {
-    blk_size = k + 2
-  }
-  if (blk_size < 0) {
-    throw new IllegalArgumentException("Block size for SVD must be > 0, defaults to k+2")
-  }
-  val m = a.numRows()
-  val n = a.numCols()
-  val maxK = min(m, n)
-  require(k <= maxK, "number of singular values must be less than min(rows, cols)")
-  val c
-  if (center == true) {
-    //TODO: Center the 'a' matrix
-    c = a // NOT FINISHED
-  }
-  c = c.asBreeze.asInstanceOf[BDM[Double]]
-  // Use the val "c" from here to refer to the source data matrix
- 
-  if (blk_size >= m / 1.25 || blk_size >= n / 1.25) {
-    //Perform NORMAL SVD Here.
-    // Return the SVD from here
-  } else if (m >= n) {
-    ///////////////////////////////////////////////////////
-    // Step 1:
-    // Generate Q matrix with values between -1 and 1.
-    // Size n rows, l col
-    ///////////////////////////////////////////////////////
-    
-    // Python from FBPCA
-    //#
-    // # Apply A to a random matrix, obtaining Q.
-    // #
-    // if isreal:
-    //     Q = mult(A, np.random.uniform(low=-1.0, high=1.0, size=(n, l)))
-    // if not isreal:
-    //     Q = mult(A, np.random.uniform(low=-1.0, high=1.0, size=(n, l))
-    //         + 1j * np.random.uniform(low=-1.0, high=1.0, size=(n, l)))
-
-    // Don't worry about isreal - just do it for normal scalars
-    
-    // multiply the original data matrix with a random matrix
-    // size m x n * n x blk_size ==> m x blk_size
-    val Q: BDM[Double] = c * ((BDM.rand(n, l) :* 2) - 1)
-
-    ////////////////////////////////////////////////////////
-    // Step 2:
-    // Perform the QR/LU decomposition
-    ////////////////////////////////////////////////////////
-
-    // Python from FBPCA
-    // #
-    // # Form a matrix Q whose columns constitute a
-    // # well-conditioned basis for the columns of the earlier Q.
-    // #
-    // if n_iter == 0:
-    //     (Q, _) = qr(Q, mode='economic')
-    // if n_iter > 0:
-    //     (Q, _) = lu(Q, permute_l=True)
-
-    if (p_iter == 0) {
-      val (Q: BDM[Double], R:BDM[Double]) = computeMode match {
-      case SVDMode.LocalARPACK =>
-        // Compute QR locally with arpack
-      case SVDMode.LocalLAPACK =>
-        // Copmute with LAPACK
-      case SVDMode.DistARPACK =>
-        // Copmute QR in distributed fashion
-      }
-    } else if (p_iter > 0) {
-      // TODO: Come up with a way to calculate the LU factorization.
-      // See
-      // https://issues.apache.org/jira/browse/SPARK-8514
-      val (Q: BDM[Double], R:BDM[Double]) = computeMode match {
-      case SVDMode.LocalARPACK =>
-        // Compute LU locally with arpack
-      case SVDMode.LocalLAPACK =>
-        // Compute LU with LAPACK
-      case SVDMode.DistARPACK =>
-        // Copmute LU in distributed fashion
-      }
+        // TODO: The conditions below are not fully tested.
+        if (n < 100 || (k > n / 2 && n <= 15000)) {
+          // If n is small or k is large compared with n, we better compute the Gramian matrix first
+          // and then compute its eigenvalues locally, instead of making multiple passes.
+          if (k < n / 3) {
+            SVDMode.LocalARPACK
+          } else {
+            SVDMode.LocalLAPACK
+          }
+        } else {
+          // If k is small compared with n, we use ARPACK with distributed multiplication.
+          SVDMode.DistARPACK
+        }
+      case "local-svd" => SVDMode.LocalLAPACK
+      case "local-eigs" => SVDMode.LocalARPACK
+      case "dist-eigs" => SVDMode.DistARPACK
+      case _ => throw new IllegalArgumentException(s"Do not support mode $mode.")
     }
-
-    /////////////////////////////////////////////////////////
-    // Step 3:
-    // Run the power method for n_iter
-    /////////////////////////////////////////////////////////
-
-    // Python Code from FBPCA
-    // #
-    // # Conduct normalized power iterations.
-    // #
-    // for it in range(n_iter):
-
-    //     Q = mult(Q.conj().T, A).conj().T
-
-    //     (Q, _) = lu(Q, permute_l=True)
-
-    //     Q = mult(A, Q)
-
-    //     if it + 1 < n_iter:
-    //         (Q, _) = lu(Q, permute_l=True)
-    //     else:
-    //         (Q, _) = qr(Q, mode='economic')
-
-    for (i <- 0 to p_iter) {
-      // We're not worried about conjugates - assume we're working with
-      // real numbers
-      // We need to write a transpose function
-      Q = transpose(transpose(Q) * c)
-
-      // We also need a function to compute the LU factorization of Q
-      val (Q: BDM[Double], U: BDM[Double]) = lu(Q)
-
-      Q = A * Q
-
-      if (i + 1 < p_iter ) {
-        // Compute LU
-      } else {
-        // Compute QR
-      }
-    
+    var bs: Int = 0;
+    if (blk_size == -1) {
+      bs = k + 2
     }
+    if (bs < 0) {
+      throw new IllegalArgumentException("Block size for SVD must be > 0, defaults to k+2")
+    }
+    val m: Long = a.numRows()
+    val nc = a.numCols()
+    val maxK = min(m, nc)
+    require(k <= maxK, "number of singular values must be less than min(rows, cols)")
+    var c: BDM[Double] = null
+    if (center) {
+      // TODO: Center the 'a' matrix
+      // *_Technically_* not finished
+      // Center the matrix first to get PCA results
+      c = a.toBreeze()
+    }
+    c = a.toBreeze()
+
+     // Use the val "c" from here to refer to the source data matrix
+     if (blk_size >= m / 1.25 || blk_size >= n / 1.25) {
+       // Perform NORMAL SVD Here.
+       // Return the SVD from here
+       a.computeSVD(k, computeU = true)
+     } else if (m >= n) {
+       ///////////////////////////////////////////////////////
+       // Step 1:
+       // Generate Q matrix with values between -1 and 1.
+       // Size n rows, l col
+       ///////////////////////////////////////////////////////
+
+       // Python from FBPCA
+       // #
+       // # Apply A to a random matrix, obtaining Q.
+       // #
+       // if isreal:
+       //     Q = mult(A, np.random.uniform(low=-1.0, high=1.0, size=(n, l)))
+       // if not isreal:
+       //     Q = mult(A, np.random.uniform(low=-1.0, high=1.0, size=(n, l))
+       //         + 1j * np.random.uniform(low=-1.0, high=1.0, size=(n, l)))
+
+       // Don't worry about isreal - just do it for normal scalars
+
+       // multiply the original data matrix with a random matrix
+       // size m x n * n x blk_size ==> m x blk_size
+       var q: BDM[Double] = c * ( (BDM.rand(n, blk_size) :* 2.0) - 1.0)
+
+       ////////////////////////////////////////////////////////
+       // Step 2:
+       // Perform the QR/LU decomposition
+       ////////////////////////////////////////////////////////
+
+       // Python from FBPCA
+       // #
+       // # Form a matrix Q whose columns constitute a
+       // # well-conditioned basis for the columns of the earlier Q.
+       // #
+       // if n_iter == 0:
+       //     (Q, _) = qr(Q, mode='economic')
+       // if n_iter > 0:
+       //     (Q, _) = lu(Q, permute_l=True)
+       if (p_iter == 0) {
+         // TODO: Come up with a way to calculate the LU factorization in a distributed fashion
+         // Calculates and returns the Q from the QR factorization
+         val qr: BQR.DenseQR = BQR.apply(q)
+         q = qr.q
+       } else if (p_iter > 0) {
+         // TODO: Come up with a way to calculate the LU factorization in a distributed fashion
+         // See
+         // https://issues.apache.org/jira/browse/SPARK-8514
+         // Calculates and returns the L from the LU factorization of the q matrix
+         var (lu, _) = BLU.apply(q)
+         q = lu
+       }
+
+       /////////////////////////////////////////////////////////
+       // Step 3:
+       // Run the power method for n_iter
+       /////////////////////////////////////////////////////////
+
+       // Python Code from FBPCA
+       // #
+       // # Conduct normalized power iterations.
+       // #
+       // for it in range(n_iter):
+
+       //     Q = mult(Q.conj().T, A).conj().T
+
+       //     (Q, _) = lu(Q, permute_l=True)
+
+       //     Q = mult(A, Q)
+
+       //     if it + 1 < n_iter:
+       //         (Q, _) = lu(Q, permute_l=True)
+       //     else:
+       //         (Q, _) = qr(Q, mode='economic')
+
+       for (i <- 0 to p_iter) {
+         // We're not worried about conjugates - assume we're working with
+         // real numbers
+         // We need to write a transpose function
+         q = (q.t * c).t
+
+         // We also need a function to compute the LU factorization of Q
+         var (q2: BDM[Double], _) = BLU.apply(q)
+         q = c * q
+
+         if (i + 1 < p_iter ) {
+           // Compute LU
+           var (q3: BDM[Double], _) = BLU.apply(q)
+           q = q3
+         } else {
+           // Compute QR
+           val qr: BQR.DenseQR = BQR.apply(q)
+           q = qr.q
+         }
+
+       }
 
 
-    /////////////////////////////////////////////////////////
-    // Step 4:
-    // SVD Q and original matrix to get singular values
-    // (Assuming using BLAS?) - We should test this.
-    /////////////////////////////////////////////////////////
+       /////////////////////////////////////////////////////////
+       // Step 4:
+       // SVD Q and original matrix to get singular values
+       // (Assuming using BLAS?) - We should test this.
+       /////////////////////////////////////////////////////////
 
-    // # SVD Q'*A to obtain approximations to the singular values
-    // # and right singular vectors of A; adjust the left singular
-    // # vectors of Q'*A to approximate the left singular vectors
-    // # of A.
-    // #
-    // QA = mult(Q.conj().T, A)
-    // (R, s, Va) = svd(QA, full_matrices=False)
-    // U = Q.dot(R)
+       // # SVD Q'*A to obtain approximations to the singular values
+       // # and right singular vectors of A; adjust the left singular
+       // # vectors of Q'*A to approximate the left singular vectors
+       // # of A.
+       // #
+       // QA = mult(Q.conj().T, A)
+       // (R, s, Va) = svd(QA, full_matrices=False)
+       // U = Q.dot(R)
 
-    val QA = transpose(Q) * A
-    // Perform local ARPACK SVD on this matrix (Or normal rowmatrix SVD?)
-    val (R, s, Va) = svd(QA)
-    val U = Q * R
+       var qa = q.t * c
+       // Perform local ARPACK SVD on this matrix (Or normal rowmatrix SVD?)
+       val brzSvd.SVD(tempU, s, v) = brzSvd(qa)
 
-    ////////////////////////////////////////////////////////
-    // Step 5:
-    // Retain only the first k rows/columns and return
-    ////////////////////////////////////////////////////////
 
-    // #
-    // # Retain only the leftmost k columns of U, the uppermost
-    // # k rows of Va, and the first k entries of s.
-    // #
-    // return U[:, :k], s[:k], Va[:k, :]
 
-    // Truncate rows of U, s, and Va
-    val svdVals: SingularValueDecomposition
 
-  } else if (m < n) {
+       ////////////////////////////////////////////////////////
+       // Step 5:
+       // Retain only the first k rows/columns and return
+       ////////////////////////////////////////////////////////
 
+       // #
+       // # Retain only the leftmost k columns of U, the uppermost
+       // # k rows of Va, and the first k entries of s.
+       // #
+       // return U[:, :k], s[:k], Va[:k, :]
+
+       // Truncate rows of U, s, and Va
+       q = q * tempU
+       var sigmas = Vectors.dense(Arrays.copyOfRange(s.data, 0, k)) // Truncated singular values
+       var U = Matrices.dense(q.rows, k, q.data)
+       var Va = Matrices.dense(k, v.cols, v.data)
+       SingularValueDecomposition(U, sigmas, Va)
+
+     } else if (m < n) {
+       var newA: linalg.Matrix = Matrices.fromBreeze(c.t)
+       val columns = newA.toArray.grouped(newA.numRows)
+       val rows = columns.toSeq.transpose // Skip this if you want a column-major RDD
+       val mat = RowMatrix(rows.map(row => new DenseVector(row.toArray)))
+       computeSVD(mat, k, center, p_iter, blk_size, mode)
+       SingularValueDecomposition(null, null, null)
+     }
+    null
   }
-
-
-  /////////////////////////////////////////////////
-  // BELOW is the old compute SVD implementation //
-  /////////////////////////////////////////////////
-
-  // // Compute the eigen-decomposition of A' * A.
-  // val (sigmaSquares: BDV[Double], u: BDM[Double]) = computeMode match {
-  //   case SVDMode.LocalARPACK =>
-  //     require(k < n, s"k must be smaller than n in local-eigs mode but got k=$k and n=$n.")
-  //     val G = computeGramianMatrix().asBreeze.asInstanceOf[BDM[Double]]
-  //     EigenValueDecomposition.symmetricEigs(v => G * v, n, k, tol, maxIter)
-  //   case SVDMode.LocalLAPACK =>
-  //     // breeze (v0.10) svd latent constraint, 7 * n * n + 4 * n < Int.MaxValue
-  //     require(n < 17515, s"$n exceeds the breeze svd capability")
-  //     val G = computeGramianMatrix().asBreeze.asInstanceOf[BDM[Double]]
-  //     val brzSvd.SVD(uFull: BDM[Double], sigmaSquaresFull: BDV[Double], _) = brzSvd(G)
-  //     (sigmaSquaresFull, uFull)
-  //   case SVDMode.DistARPACK =>
-  //     if (rows.getStorageLevel == StorageLevel.NONE) {
-  //       logWarning("The input data is not directly cached, which may hurt performance if its"
-  //         + " parent RDDs are also uncached.")
-  //     }
-  //     require(k < n, s"k must be smaller than n in dist-eigs mode but got k=$k and n=$n.")
-  //     EigenValueDecomposition.symmetricEigs(multiplyGramianMatrixBy, n, k, tol, maxIter)
-  // }
-
-  // val sigmas: BDV[Double] = brzSqrt(sigmaSquares)
-
-  // // Determine the effective rank.
-  // val sigma0 = sigmas(0)
-  // val threshold = rCond * sigma0
-  // var i = 0
-  // // sigmas might have a length smaller than k, if some Ritz values do not satisfy the convergence
-  // // criterion specified by tol after max number of iterations.
-  // // Thus use i < min(k, sigmas.length) instead of i < k.
-  // if (sigmas.length < k) {
-  //   logWarning(s"Requested $k singular values but only found ${sigmas.length} converged.")
-  // }
-  // while (i < math.min(k, sigmas.length) && sigmas(i) >= threshold) {
-  //   i += 1
-  // }
-  // val sk = i
-
-  // if (sk < k) {
-  //   logWarning(s"Requested $k singular values but only found $sk nonzeros.")
-  // }
-
-  // // Warn at the end of the run as well, for increased visibility.
-  // if (computeMode == SVDMode.DistARPACK && rows.getStorageLevel == StorageLevel.NONE) {
-  //   logWarning("The input data was not directly cached, which may hurt performance if its"
-  //     + " parent RDDs are also uncached.")
-  // }
-
-  // val s = Vectors.dense(Arrays.copyOfRange(sigmas.data, 0, sk))
-  // val V = Matrices.dense(n, sk, Arrays.copyOfRange(u.data, 0, n * sk))
-
-  // if (computeU) {
-  //   // N = Vk * Sk^{-1}
-  //   val N = new BDM[Double](n, sk, Arrays.copyOfRange(u.data, 0, n * sk))
-  //   var i = 0
-  //   var j = 0
-  //   while (j < sk) {
-  //     i = 0
-  //     val sigma = sigmas(j)
-  //     while (i < n) {
-  //       N(i, j) /= sigma
-  //       i += 1
-  //     }
-  //     j += 1
-  //   }
-  //   val U = this.multiply(Matrices.fromBreeze(N))
-  //   SingularValueDecomposition(U, s, V)
-  // } else {
-  //   SingularValueDecomposition(null, s, V)
-  // }
 }
 
 
