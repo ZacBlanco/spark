@@ -20,6 +20,7 @@ package org.apache.spark.mllib.linalg.distributed;
 import java.util.Arrays
 
 import org.apache.spark.annotation.Since
+import org.apache.spark.mllib.linalg.{Matrix => SparkMatrix}
 import org.apache.spark.mllib.linalg.Matrices
 import org.apache.spark.mllib.linalg.Vectors
 import org.apache.spark.mllib.linalg.DenseVector
@@ -28,6 +29,7 @@ import org.apache.spark.mllib.linalg.distributed.RowMatrix
 import breeze.linalg.{Matrix, MatrixSingularException, inv, DenseMatrix => BDM, DenseVector => BDV, LU => BLU, SparseVector => BSV, axpy => brzAxpy, qr => BQR, svd => brzSvd}
 import breeze.numerics.{sqrt => brzSqrt}
 import org.apache.spark.mllib.linalg
+import org.apache.spark.rdd.RDD
 
 object fastSVD {
 
@@ -83,12 +85,18 @@ object fastSVD {
   def transpose(a: BDM[Double]): BDM[Double] = {
     a.t
   }
+//  def MatrixToRM(m: SparkMatrix): RowMatrix = {
+//    val cols = m.toArray.grouped(m.numRows)
+//    val rows = cols.toSeq.transpose
+//    val vecs = rows.map(r => new DenseVector(r.toArray))
+//    RowMatrix(sc.parallelize(vecs))
+//  }
 
   @Since("1.0.0")
   def computeSVD(
       a: RowMatrix,
       k: Int
-      ): SingularValueDecomposition[RowMatrix, RowMatrix] = {
+      ): SingularValueDecomposition[SparkMatrix, SparkMatrix] = {
 
     computeSVD(a, k)
   }
@@ -116,7 +124,7 @@ object fastSVD {
       center: Boolean = false,
       p_iter: Int = 2,
       blk_size: Int = -1,
-      mode: String): SingularValueDecomposition[RowMatrix, RowMatrix] = {
+      mode: String): SingularValueDecomposition[SparkMatrix, SparkMatrix] = {
     var n = a.numCols().toInt
     require(k > 0 && k <= n, s"Requested k singular values but got k=$k and numCols=$n.")
 
@@ -172,7 +180,11 @@ object fastSVD {
      if (blk_size >= m / 1.25 || blk_size >= n / 1.25) {
        // Perform NORMAL SVD Here.
        // Return the SVD from here
-       a.computeSVD(k, computeU = true)
+       var lameSVD: SingularValueDecomposition[RowMatrix, SparkMatrix] = a.computeSVD(k, computeU = true)
+       var u = lameSVD.U
+       var umat = Matrices.dense(u.numRows().toInt, u.numCols().toInt, u.toBreeze().data)
+       SingularValueDecomposition(umat, lameSVD.s, lameSVD.V)
+
      } else if (m >= n) {
        ///////////////////////////////////////////////////////
        // Step 1:
@@ -194,7 +206,7 @@ object fastSVD {
 
        // multiply the original data matrix with a random matrix
        // size m x n * n x blk_size ==> m x blk_size
-       var q: BDM[Double] = c * ( (BDM.rand(n, blk_size) :* 2.0) - 1.0)
+       var q: BDM[Double] = c * ( (BDM.rand(n, blk_size) *:* 2.0) - 1.0)
 
        ////////////////////////////////////////////////////////
        // Step 2:
@@ -310,14 +322,15 @@ object fastSVD {
        SingularValueDecomposition(U, sigmas, Va)
 
      } else if (m < n) {
-       var newA: linalg.Matrix = Matrices.fromBreeze(c.t)
-       val columns = newA.toArray.grouped(newA.numRows)
-       val rows = columns.toSeq.transpose // Skip this if you want a column-major RDD
-       val mat = RowMatrix(rows.map(row => new DenseVector(row.toArray)))
-       computeSVD(mat, k, center, p_iter, blk_size, mode)
+//       var newA: linalg.Matrix = Matrices.fromBreeze(c.t)
+//       val columns = newA.toArray.grouped(newA.numRows)
+//       val rows = columns.toSeq.transpose // Skip this if you want a column-major RDD
+//       val mat = RowMatrix(rows.map(row => new DenseVector(row.toArray)))
+//       computeSVD(mat, k, center, p_iter, blk_size, mode)
        SingularValueDecomposition(null, null, null)
+     } else {
+       null
      }
-    null
   }
 }
 
