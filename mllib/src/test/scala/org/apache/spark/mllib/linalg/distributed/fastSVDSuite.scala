@@ -17,18 +17,21 @@
 
 package org.apache.spark.mllib.linalg.distributed
 
+import org.scalatest.Ignore
+
 import java.util.Arrays
 
 import scala.util.Random
-
-import breeze.linalg.{norm => brzNorm, svd => brzSvd, DenseMatrix => BDM, DenseVector => BDV}
+import breeze.linalg.{DenseMatrix => BDM, DenseVector => BDV, norm => brzNorm, svd => brzSvd, ReducedQR => BQR}
 import breeze.numerics.abs
-
+import org.apache.spark.mllib.linalg.distributed.fastSVD
 import org.apache.spark.SparkFunSuite
-import org.apache.spark.mllib.linalg.{Matrices, Vector, Vectors}
+import org.apache.spark.mllib.linalg._
+import org.apache.spark.mllib.linalg.Matrices
 import org.apache.spark.mllib.random.RandomRDDs
 import org.apache.spark.mllib.util.{LocalClusterSparkContext, MLlibTestSparkContext}
 import org.apache.spark.mllib.util.TestingUtils._
+import org.apache.spark.rdd.RDD
 
 class fastSVDSuite extends SparkFunSuite with MLlibTestSparkContext {
 
@@ -63,86 +66,142 @@ class fastSVDSuite extends SparkFunSuite with MLlibTestSparkContext {
     sparseMat = new RowMatrix(sc.parallelize(sparseData, 2))
   }
 
-  test("toBreeze") {
-    val expected = BDM(
-      (0.0, 1.0, 2.0),
-      (3.0, 4.0, 5.0),
-      (6.0, 7.0, 8.0),
-      (9.0, 0.0, 1.0))
-    for (mat <- Seq(denseMat, sparseMat)) {
-      assert(mat.toBreeze() === expected)
+  def randomMat(trows: Int, tcols: Int): RowMatrix = {
+    var testMat: BDM[Double] = BDM.rand(trows, tcols)
+    var x: Matrix = Matrices.dense(testMat.rows, testMat.cols, testMat.data)
+    val cols = x.toArray.grouped(x.numRows)
+    val rows = cols.toSeq.transpose
+    val vecs = rows.map(row => new DenseVector(row.toArray))
+    val rddtemp: RDD[Vector] = sc.parallelize(vecs, 2)
+    new RowMatrix(rddtemp)
+  }
+
+  def showTimeDiff(t1: Long, t2: Long, msg: String = "Time difference: "): Long = {
+    val diff = t2 - t1
+    print(msg + diff + "ms\n")
+    diff
+  }
+
+  def min(a: Int, b: Int): Int = {
+    val x = if (a < b) a else b
+    x
+  }
+
+
+  ignore("basicSVD") {
+    //1110x410
+    for (matrows <- 10 to 2000 by 100) {
+      for (matcols <- 10 to 2000 by 100) {
+
+        for (numk <- 10 to min(matrows, matcols) by 25) {
+          var denseRowMat: RowMatrix = randomMat(matrows, matcols)
+          var t1 = System.currentTimeMillis()
+          val a = fastSVD.computeSVD(denseRowMat, numk)
+          var t2 = System.currentTimeMillis()
+          var t3 = showTimeDiff(t1, t2,
+            matrows + "x" + matcols + " " + numk + " Singular, fastSVD ")
+
+          t1 = System.currentTimeMillis()
+          var v: SingularValueDecomposition[RowMatrix, Matrix] = denseRowMat.computeSVD(numk, true)
+          t2 = System.currentTimeMillis()
+          var t4 = showTimeDiff(t1, t2,
+            matrows + "x" + matcols + " " + numk + " Singular, Spark ")
+          showTimeDiff(t3, t4, "Spark - fastSVD time ")
+        }
+      }
     }
   }
 
-  test("multiply a local matrix") {
-    val B = Matrices.dense(n, 2, Array(0.0, 1.0, 2.0, 3.0, 4.0, 5.0))
-    for (mat <- Seq(denseMat, sparseMat)) {
-      val AB = mat.multiply(B)
-      assert(AB.numRows() === m)
-      assert(AB.numCols() === 2)
-      assert(AB.rows.collect().toSeq === Seq(
-        Vectors.dense(5.0, 14.0),
-        Vectors.dense(14.0, 50.0),
-        Vectors.dense(23.0, 86.0),
-        Vectors.dense(2.0, 32.0)
-      ))
-    }
+  def matnorm(a: BDM[Double]): Double = {
+    val b: BDM[Double] = a *:* a
+    val c: Double = breeze.linalg.sum(b)
+    math.sqrt(c)
   }
-//
-//  test("QR Decomposition") {
-//    for (mat <- Seq(denseMat, sparseMat)) {
-//      val result = mat.tallSkinnyQR(true)
-//      val expected = breeze.linalg.qr.reduced(mat.toBreeze())
-//      val calcQ = result.Q
-//      val calcR = result.R
-//      assert(closeToZero(abs(expected.q) - abs(calcQ.toBreeze())))
-//      assert(closeToZero(abs(expected.r) - abs(calcR.asBreeze.asInstanceOf[BDM[Double]])))
-//      assert(closeToZero(calcQ.multiply(calcR).toBreeze - mat.toBreeze()))
-//      // Decomposition without computing Q
-//      val rOnly = mat.tallSkinnyQR(computeQ = false)
-//      assert(rOnly.Q == null)
-//      assert(closeToZero(abs(expected.r) - abs(rOnly.R.asBreeze.asInstanceOf[BDM[Double]])))
-//    }
-//  }
+  def testSVDDiff(svd1: SingularValueDecomposition[Matrix, Matrix],
+                  svd2: SingularValueDecomposition[RowMatrix, Matrix],
+                  orig: BDM[Double]): (Double, Double, Double) = {
+    var sdiff = svd1.s.asBreeze - svd2.s.asBreeze
+    var st: Double = breeze.linalg.sum(sdiff *:* sdiff)
+    val snorm: Double = math.sqrt(st)
 
-//  test("compute covariance") {
-//    for (mat <- Seq(denseMat, sparseMat)) {
-//      val result = mat.computeCovariance()
-//      val expected = breeze.linalg.cov(mat.toBreeze())
-//      assert(closeToZero(abs(expected) - abs(result.asBreeze.asInstanceOf[BDM[Double]])))
+    var u1 = svd1.U.asBreeze.asInstanceOf[BDM[Double]]
+    var u2 = svd2.U.toBreeze()
+    var udiff: BDM[Double] = u1 - u2
+    var unorm = matnorm(udiff)
+
+    var v1 = svd1.V.asBreeze.asInstanceOf[BDM[Double]]
+    var v2 = svd2.V.asBreeze.asInstanceOf[BDM[Double]].t
+    var vdiff: BDM[Double] = v1 - v2
+    var vnorm = matnorm(vdiff)
+
+    var tm = u1 * breeze.linalg.diag(svd1.s.asBreeze.asInstanceOf[BDV[Double]]) * v1
+    var normdiff = matnorm(tm - orig)
+
+    println(unorm)
+//    println(snorm)
+//    println(vnorm)
+//    println(normdiff)
+//
+    println("U1")
+    println(u1)
+    println("U2")
+    println(u2)
+
+    println("V1")
+    println(v1)
+    println("V2")
+    println(v2)
+    if (unorm > 1) {
+
+    }
+    if (vnorm > 1) {
+
+    }
+
+//    assert(unorm < svd2.s.asBreeze.asInstanceOf[BDV[Double]](0)*.1)
+//    assert(snorm < .1)
+//    assert(vnorm < .1)
+    (unorm, snorm, vnorm)
+//    (0, 0, 0)
+  }
+
+  test("LU Factorization") {
+//    var drm = randomMat(3, 3).toBreeze().asInstanceOf[BDM[Double]]
+    val r: Array[Double] = Array(1, 3, 2, 2, 8, 6, 4, 14, 13)
+    var drm: BDM[Double] = new BDM[Double](3, 3, r)
+    var (pl, u) = fastSVD.LUFactorization(drm, pl_only = false)
+    assert(matnorm(pl*u - drm) < 0.1)
+//    for (x <- 4 to 100) {
+//      drm = randomMat(x, x).toBreeze()
+//      var (pl, u) = fastSVD.LUFactorization(drm, pl_only = false)
+//      assert(matnorm(pl*u - drm) < 0.1)
 //    }
-//  }
-//
-//
-//  test("QR decomposition should aware of empty partition (SPARK-16369)") {
-//    val mat: RowMatrix = new RowMatrix(sc.parallelize(denseData, 1))
-//    val qrResult = mat.tallSkinnyQR(true)
-//
-//    val matWithEmptyPartition = new RowMatrix(sc.parallelize(denseData, 8))
-//    val qrResult2 = matWithEmptyPartition.tallSkinnyQR(true)
-//
-//    assert(qrResult.Q.numCols() === qrResult2.Q.numCols(), "Q matrix ncol not match")
-//    assert(qrResult.Q.numRows() === qrResult2.Q.numRows(), "Q matrix nrow not match")
-//    qrResult.Q.rows.collect().zip(qrResult2.Q.rows.collect())
-//      .foreach(x => assert(x._1 ~== x._2 relTol 1E-8, "Q matrix not match"))
-//
-//    qrResult.R.toArray.zip(qrResult2.R.toArray)
-//      .foreach(x => assert(x._1 ~== x._2 relTol 1E-8, "R matrix not match"))
-//  }
+
+  }
+  ignore("fastSVD correctness") {
+    var m = 40
+    var n = 20
+    var k = 10
+    var drm: RowMatrix = randomMat(m, n)
+    var a = fastSVD.computeSVD(drm, k, p_iter = 2)
+    var b = drm.computeSVD(k, computeU = true)
+    System.out.println("m: " + m + " n: " + n + " k: " + 3)
+    testSVDDiff(a, b, drm.toBreeze().asInstanceOf[BDM[Double]])
+
+
+//    for (m <- 10 to 100 by 25) {
+//      for (n <- 10 to 100 by 25) {
+//        for (k <- 5 to 75 by 20) {
+//          var h: Int = min(k, min(m, n))
+//          var drm: RowMatrix = randomMat(m, n)
+//          var a = fastSVD.computeSVD(drm, h)
+//          var b = drm.computeSVD(h, computeU = true)
+//          System.out.println("m: " + m + " n: " + n + " k: " + h)
+//          testSVDDiff(a, b, drm.toBreeze().asInstanceOf[BDM[Double]])
+//        }
+//      }
+//    }
+
+
+  }
 }
-
-//class RowMatrixClusterSuite extends SparkFunSuite with LocalClusterSparkContext {
-//
-//  var mat: RowMatrix = _
-//
-//  override def beforeAll() {
-//    super.beforeAll()
-//    val m = 4
-//    val n = 200000
-//    val rows = sc.parallelize(0 until m, 2).mapPartitionsWithIndex { (idx, iter) =>
-//      val random = new Random(idx)
-//      iter.map(i => Vectors.dense(Array.fill(n)(random.nextDouble())))
-//    }
-//    mat = new RowMatrix(rows)
-//  }
-//}
